@@ -31,9 +31,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 Install from GitHub:
 
 ```bash
-pip install --no-build-isolation "git+https://github.com/<USER>/flash-lfilter.git@v1.0.0"
-# or from main:
-# pip install --no-build-isolation "git+https://github.com/<USER>/flash-lfilter.git@main"
+pip install --no-build-isolation "git+https://github.com/guyfloki/flash-lfilter.git@main"
 ```
 
 Editable (local) install for development:
