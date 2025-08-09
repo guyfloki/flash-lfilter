@@ -47,17 +47,20 @@ Why `--no-build-isolation`? It lets the build see the already-installed `torch`,
 
 ```python
 import torch
-import flashlfilter  # importing the package registers the custom op
+import flashlfilter
 
 B, C, N, K = 2, 3, 16000, 5
 x = torch.randn(B, C, N, device="cuda", dtype=torch.float32)
 
-a = torch.zeros(C, K, device=x.device); a[:, 0] = 1.0
-b = torch.rand(C, K, device=x.device)
+a = torch.zeros(C, K, device=x.device, dtype=torch.float32, requires_grad=True)
+b = torch.rand(C, K, device=x.device, dtype=torch.float32, requires_grad=True)
+with torch.no_grad():
+    a[:, 0] = 1.0 
 
 y = flashlfilter.lfilter_autograd(x, a, b, chunk_size=1024)
 loss = y.pow(2).mean()
-loss.backward()
+loss.backward() 
+print(a.grad.shape, b.grad.shape)
 ```
 
 You can also call the op directly:
