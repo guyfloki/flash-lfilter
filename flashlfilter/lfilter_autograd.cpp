@@ -91,7 +91,7 @@ public:
 
     auto a_norm = a_coeffs / a0;                         // [C,K]
     auto b_norm = b_coeffs / a0;                         // [C,K]
-    auto b_weight = b_norm.flip({1}).unsqueeze(1);       // [C,1,K] — depthwise weight
+    auto b_weight = b_norm.flip({1}).unsqueeze(1);       // [C,1,K] 
 
     auto waveform_padded = at::constant_pad_nd(waveform, {K - 1, 0}); // [B,C,N+K-1]
 
@@ -137,38 +137,41 @@ public:
     const auto N = waveform.size(2);
     const auto K = a_norm.size(1);
 
-    auto a_flipped = a_norm.flip({1});                     // [C,K]
-    auto grad_output_flipped = grad_output.flip({2});      // [B,C,N]
+    auto a_flipped = a_norm.flip({1});                  // [C,K]
+    auto grad_output_flipped = grad_output.flip({2});   // [B,C,N]
     auto grad_fir_out_flipped = run_iir(grad_output_flipped, a_flipped, chunk_size); // [B,C,N]
-    auto grad_fir_out = grad_fir_out_flipped.flip({2});    // [B,C,N]
-
-    auto b_weight = b_norm.flip({1}).unsqueeze(1);         // [C,1,K]
+    auto grad_fir_out = grad_fir_out_flipped.flip({2}); // [B,C,N]
+    
+    auto b_weight = b_norm.flip({1}).unsqueeze(1);      // [C,1,K]
+    
+    auto waveform_padded = at::constant_pad_nd(waveform, {K - 1, 0}).contiguous(); // [B,C,N+K-1]
+    
     auto grad_tuple = at::convolution_backward(
         /*grad_output=*/grad_fir_out,    // [B,C,N]
-        /*input=*/waveform,              // [B,C,N]
+        /*input=*/waveform_padded,       // [B,C,N+K-1]
         /*weight=*/b_weight,             // [C,1,K]
         /*bias_sizes=*/c10::nullopt,
         /*stride=*/{1},
-        /*padding=*/{K - 1},             
+        /*padding=*/{0},                
         /*dilation=*/{1},
         /*transposed=*/false,
         /*output_padding=*/{0},
         /*groups=*/C,
         /*output_mask=*/{true, true, false}
     );
-
-    auto grad_waveform = std::get<0>(grad_tuple);          // [B,C,N]
-    auto grad_b_weight = std::get<1>(grad_tuple);          // [C,1,K]
-    auto grad_b_norm   = grad_b_weight.squeeze(1).flip({1}); // [C,K]
-
+    
+    auto grad_waveform_padded = std::get<0>(grad_tuple);                                    // [B,C,N+K-1]
+    auto grad_waveform = grad_waveform_padded.index({idx::Slice(), idx::Slice(), idx::Slice(K - 1, torch::indexing::None)}).contiguous(); // [B,C,N]
+    auto grad_b_weight = std::get<1>(grad_tuple);                                           // [C,1,K]
+    auto grad_b_norm   = grad_b_weight.squeeze(1).flip({1});                                // [C,K]
+    
     auto conv_input_padded = at::constant_pad_nd(forward_out, {K - 1, 0}); // [B,C,N+K-1]
-    auto conv_input = conv_input_padded.view({1, B * C, N + K - 1});       // [1,BC,N+K-1]
-
+    auto conv_input  = conv_input_padded.view({1, B * C, N + K - 1});      // [1,BC,N+K-1]
     auto conv_weight = grad_fir_out.view({B * C, 1, N});                   // [BC,1,N]
-
+    
     auto grad_a_norm_batched_flipped = -at::convolution(
-        conv_input,           // [1,BC,N+K-1]
-        conv_weight,          // [BC,1,N]
+        conv_input,                // [1,BC,N+K-1]
+        conv_weight,               // [BC,1,N]
         /*bias=*/c10::nullopt,
         /*stride=*/{1},
         /*padding=*/{0},
@@ -176,21 +179,19 @@ public:
         /*transposed=*/false,
         /*output_padding=*/{0},
         /*groups=*/B * C
-    ).squeeze(); // [BC,K]
-
+    ).squeeze(0); // [BC,K]
+    
     auto grad_a_norm_batched = grad_a_norm_batched_flipped.flip({1}); // [BC,K]
-
     auto grad_a_norm_ = grad_a_norm_batched.view({B, C, K}).sum(0);   // [C,K]
-
-    auto grad_a0 = (-(grad_a_norm_ * a_norm).sum(1, true)   // [C,1]
-                    -(grad_b_norm  * b_norm).sum(1, true))  // [C,1]
-                    / a0;                                   // [C,1]
-
-    auto grad_a = grad_a_norm_ / a0;                        // [C,K]
+    
+    auto grad_a0 = (-(grad_a_norm_ * a_norm).sum(1, true)
+                    -(grad_b_norm  * b_norm).sum(1, true)) / a0;      // [C,1]
+    
+    auto grad_a = grad_a_norm_ / a0;                                   // [C,K]
     grad_a.index_put_({idx::Slice(), 0},
                       grad_a.index({idx::Slice(), 0}) + grad_a0.squeeze(1));
-    auto grad_b = grad_b_norm / a0;                         // [C,K]
-
+    auto grad_b = grad_b_norm / a0;                                     // [C,K]
+    
     return {grad_waveform, grad_a, grad_b, torch::Tensor()};
   }
 };
