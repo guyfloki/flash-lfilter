@@ -207,7 +207,7 @@ static at::Tensor lfilter_autograd(
 TORCH_LIBRARY(flashlfilter, m) {
   m.def("lfilter_autograd(Tensor waveform, Tensor a, Tensor b, int chunk_size) -> Tensor");
 }
-TORCH_LIBRARY_IMPL(flashlfilter, Autograd, m) {
+TORCH_LIBRARY_IMPL(flashlfilter, CompositeExplicitAutograd, m) {
   m.impl("lfilter_autograd", lfilter_autograd);
 }
 
