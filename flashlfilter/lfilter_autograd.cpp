@@ -158,16 +158,16 @@ static at::Tensor lfilter_forward_fused(const at::Tensor& x, const at::Tensor& a
   return lfilter_forward_fused_impl(x, a, b);
 }
 
-TORCH_LIBRARY(flashlfilterx, m) {
+TORCH_LIBRARY(flashlfilter, m) {
+  m.def("lfilter_autograd(Tensor waveform, Tensor a, Tensor b, int chunk_size) -> Tensor");
   m.def("lfilter_forward_fused(Tensor waveform, Tensor a, Tensor b, int chunk_size) -> Tensor");
-  m.def("lfilter_autograd_fused(Tensor waveform, Tensor a, Tensor b, int chunk_size) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(flashlfilterx, CompositeExplicitAutograd, m) {
-  m.impl("lfilter_forward_fused",      lfilter_forward_fused);
-  m.impl("lfilter_autograd_fused", [](const at::Tensor& x, const at::Tensor& a, const at::Tensor& b, int64_t chunk){
+TORCH_LIBRARY_IMPL(flashlfilter, CompositeExplicitAutograd, m) {
+  m.impl("lfilter_autograd", [](const at::Tensor& x, const at::Tensor& a, const at::Tensor& b, int64_t chunk){
     return FlashLFilterAutogradFused::apply(x, a, b, chunk);
   });
+  m.impl("lfilter_forward_fused", lfilter_forward_fused);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
