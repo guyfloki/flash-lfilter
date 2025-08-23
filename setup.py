@@ -7,9 +7,7 @@ PACKAGE = "flashlfilter"
 if CUDA_HOME is None:
     raise RuntimeError(
         "CUDA toolkit not found (CUDA_HOME is None). "
-        "Install a CUDA toolkit compatible with your PyTorch build, "
-        "or install this package in an environment with CUDA available. "
-        "This setup.py does not target CPU-only builds."
+        "Install a CUDA toolkit compatible with your PyTorch build."
     )
 
 readme = ""
@@ -17,10 +15,21 @@ readme_path = Path(__file__).parent / "README.md"
 if readme_path.exists():
     readme = readme_path.read_text(encoding="utf-8")
 
+nvcc_args = [
+    "-O3",
+    "-std=c++17",
+    "-U__CUDA_NO_HALF_OPERATORS__",
+    "-U__CUDA_NO_HALF_CONVERSIONS__",
+    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+    "--use_fast_math",
+    "-Xptxas", "-maxrregcount=64",
+    "-Xptxas", "-dlcm=cg",
+]
+
 setup(
     name="flash-lfilter",
-    version="1.0.0",
-    description="Fast IIR filter (lfilter) with PyTorch CUDA and autograd",
+    version="2.0.0",
+    description="Fast fused FIR+IIR (lfilter) with PyTorch CUDA and autograd",
     long_description=readme,
     long_description_content_type="text/markdown",
     author="Liubomyr Horbatko",
@@ -39,7 +48,7 @@ setup(
             include_dirs=[PACKAGE],
             extra_compile_args={
                 "cxx": ["-std=c++17", "-O3"],
-                "nvcc": ["-std=c++17", "-O3"],
+                "nvcc": nvcc_args,
             },
         ),
     ],
