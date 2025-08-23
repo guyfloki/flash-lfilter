@@ -4,211 +4,170 @@
 
 namespace idx = torch::indexing;
 
-static void iir_core_generic_loop(
-    const at::Tensor& input,        
-    const at::Tensor& a_flipped,    
-    at::Tensor& padded              
+static at::Tensor fused_cpu_forward(
+    const at::Tensor& x,          // [B,C,N] CPU
+    const at::Tensor& a_norm,     // [C,K]   CPU
+    const at::Tensor& b_norm      // [C,K]   CPU
 ) {
-  TORCH_CHECK(!input.is_cuda(), "iir_core_generic_loop: expected CPU tensor for input");
-  TORCH_CHECK(!a_flipped.is_cuda(), "iir_core_generic_loop: expected CPU tensor for a_flipped");
-  TORCH_CHECK(!padded.is_cuda(), "iir_core_generic_loop: expected CPU tensor for padded");
-
-  const int64_t B = input.size(0);
-  const int64_t C = input.size(1);
-  const int64_t N = input.size(2);
-  const int64_t K = a_flipped.size(1);
-
-  padded.zero_();
-
-  for (int64_t bc = 0; bc < B * C; ++bc) {
-    const int64_t b = bc / C;
-    const int64_t c = bc % C;
-
-    auto in  = input.index({b, c});
-    auto out = padded.index({b, c});
-    auto a_c = a_flipped.index({c});
-
-    for (int64_t t = 0; t < N; ++t) {
-      double acc = in[t].item<double>();
-      for (int64_t k = 1; k < K; ++k) {
-        acc -= a_c[K - 1 - k].item<double>() * out[t + K - 1 - k].item<double>();
+  TORCH_CHECK(!x.is_cuda() && !a_norm.is_cuda() && !b_norm.is_cuda(), "expected CPU tensors");
+  const auto B = x.size(0), C = x.size(1), N = x.size(2), K = a_norm.size(1);
+  auto y = torch::empty_like(x);
+  for (int64_t b=0;b<B;++b) {
+    for (int64_t c=0;c<C;++c) {
+      auto xc = x.index({b,c});
+      auto yc = y.index({b,c});
+      auto a  = a_norm.index({c});
+      auto bn = b_norm.index({c});
+      std::vector<double> yhist(std::max<int64_t>(K-1,0), 0.0);
+      std::vector<double> xring(std::max<int64_t>(K,1),    0.0);
+      int pos = 0;
+      for (int64_t t=0;t<N;++t) {
+        double xnew = xc[t].item<double>();
+        if (K>0) xring[pos] = xnew;
+        double fir = 0.0;
+        for (int64_t j=0;j<K;++j) {
+          int idx = (pos - j); if (idx < 0) idx += K;
+          fir += bn[j].item<double>() * xring[idx];
+        }
+        double acc = fir;
+        for (int64_t k=1;k<K;++k) acc -= a[k].item<double>() * yhist[k-1];
+        if (K>1) {
+          for (int64_t k=K-2;k>=1;--k) yhist[k] = yhist[k-1];
+          if (K-1>0) yhist[0] = acc;
+        }
+        yc[t] = acc;
+        if (K>0) pos = (pos + 1) % K;
       }
-      out[t + K - 1] = acc;
     }
   }
+  return y;
 }
 
-
-static at::Tensor run_iir(
-    const at::Tensor& input,        // [B, C, N]
-    const at::Tensor& a_flipped,    // [C, K]
-    int64_t chunk_size
+static at::Tensor lfilter_forward_fused_impl(
+    const at::Tensor& waveform,   // [B,C,N]
+    const at::Tensor& a_coeffs,   // [C,K]
+    const at::Tensor& b_coeffs    // [C,K]
 ) {
-  TORCH_CHECK(input.dim() == 3, "run_iir: input must be [B, C, N]");
-  TORCH_CHECK(a_flipped.dim() == 2, "run_iir: a_flipped must be [C, K]");
-  TORCH_CHECK(input.size(1) == a_flipped.size(0), "run_iir: C must match between input and a_flipped");
+  TORCH_CHECK(waveform.dim()==3, "waveform [B,C,N]");
+  TORCH_CHECK(a_coeffs.dim()==2 && b_coeffs.dim()==2, "a,b [C,K]");
+  TORCH_CHECK(a_coeffs.size(0)==waveform.size(1) && b_coeffs.size(0)==waveform.size(1), "C mismatch");
+  TORCH_CHECK(a_coeffs.size(1)==b_coeffs.size(1), "K mismatch");
 
-  const auto B = input.size(0);
-  const auto C = input.size(1);
-  const auto N = input.size(2);
-  const auto K = a_flipped.size(1);
+  const auto K = b_coeffs.size(1);
+  auto a0 = a_coeffs.index({idx::Slice(), 0}).unsqueeze(1);
+  constexpr double EPS = 1e-8;
+  TORCH_CHECK(a0.abs().min().item<double>()>EPS, "a[:,0] must be non-zero");
 
-  auto padded = torch::empty({B, C, N + K - 1}, input.options());
+  auto a_norm = a_coeffs / a0;
+  auto b_norm = b_coeffs / a0;
 
-  if (input.is_cuda()) {
-    cuda_lfilter_core_loop_chunked(input, a_flipped.contiguous(), padded, chunk_size);
+  if (waveform.is_cuda()) {
+    auto y = torch::empty_like(waveform);
+    cuda_lfilter_fused_persistent(
+        waveform.contiguous(), a_norm.contiguous(), b_norm.contiguous(), y);
+    return y;
   } else {
-    iir_core_generic_loop(input.contiguous(), a_flipped.contiguous(), padded);
+    return fused_cpu_forward(waveform.contiguous(), a_norm.contiguous(), b_norm.contiguous());
   }
-
-  return padded.index({idx::Slice(), idx::Slice(), idx::Slice(K - 1, torch::indexing::None)});
 }
 
+static at::Tensor iir_only_with_fused(
+    const at::Tensor& x,          // [B,C,N]
+    const at::Tensor& a_norm      // [C,K] (a_norm[:,0]==1)
+) {
+  auto B = x.size(0), C = x.size(1), N = x.size(2), K = a_norm.size(1);
+  auto b_imp = torch::zeros({C, K}, a_norm.options());
+  b_imp.index_put_({idx::Slice(), 0}, 1.0);
+  if (x.is_cuda()) {
+    auto y = torch::empty_like(x);
+    cuda_lfilter_fused_persistent(x.contiguous(), a_norm.contiguous(), b_imp.contiguous(), y);
+    return y;
+  } else {
+    return fused_cpu_forward(x.contiguous(), a_norm.contiguous(), b_imp.contiguous());
+  }
+}
 
-class FlashLFilterAutograd : public torch::autograd::Function<FlashLFilterAutograd> {
+class FlashLFilterAutogradFused : public torch::autograd::Function<FlashLFilterAutogradFused> {
 public:
-  static at::Tensor forward(
-      torch::autograd::AutogradContext* ctx,
-      const at::Tensor& waveform,   // [B, C, N]
-      const at::Tensor& a_coeffs,   // [C, K]
-      const at::Tensor& b_coeffs,   // [C, K]
-      int64_t chunk_size) {
+  static at::Tensor forward(torch::autograd::AutogradContext* ctx,
+                            const at::Tensor& waveform,
+                            const at::Tensor& a_coeffs,
+                            const at::Tensor& b_coeffs,
+                            int64_t /*chunk_size_unused*/) {
+    auto y = lfilter_forward_fused_impl(waveform, a_coeffs, b_coeffs);
 
-    TORCH_CHECK(waveform.dim() == 3, "waveform must be [B, C, N]");
-    TORCH_CHECK(a_coeffs.dim() == 2 && b_coeffs.dim() == 2, "a_coeffs and b_coeffs must be [C, K]");
-    TORCH_CHECK(a_coeffs.size(0) == waveform.size(1), "a_coeffs[C,K]: C must match waveform.size(1)");
-    TORCH_CHECK(b_coeffs.size(0) == waveform.size(1), "b_coeffs[C,K]: C must match waveform.size(1)");
-    TORCH_CHECK(a_coeffs.size(1) == b_coeffs.size(1), "a_coeffs and b_coeffs must share K");
-
-    const auto K = b_coeffs.size(1);
-
-    auto a0 = a_coeffs.index({idx::Slice(), 0}).unsqueeze(1); // [C,1]
-    constexpr double kA0_EPS = 1e-8; 
-    TORCH_CHECK(
-        a0.abs().min().item<double>() > kA0_EPS,
-        "flashlfilter: a[:,0] must be non-zero; require |a0| > ", kA0_EPS
-    );
-
-    auto a_norm = a_coeffs / a0;                         // [C,K]
-    auto b_norm = b_coeffs / a0;                         // [C,K]
-    auto b_weight = b_norm.flip({1}).unsqueeze(1);       // [C,1,K] 
-
-    auto waveform_padded = at::constant_pad_nd(waveform, {K - 1, 0}); // [B,C,N+K-1]
-
-    auto fir_out = at::convolution(
-        waveform_padded,
-        b_weight,                   // [C,1,K]
-        /*bias=*/c10::nullopt,
-        /*stride=*/{1},
-        /*padding=*/{0},
-        /*dilation=*/{1},
-        /*transposed=*/false,
-        /*output_padding=*/{0},
-        /*groups=*/a_coeffs.size(0) // == C
-    ); // -> [B,C,N]
-
-    auto a_flipped = a_norm.flip({1}).contiguous();      // [C,K]
-    auto final_out = run_iir(fir_out, a_flipped, chunk_size); // [B,C,N]
-
-    ctx->save_for_backward({waveform, a_norm, b_norm, final_out, a0});
-    ctx->saved_data["chunk_size"] = chunk_size;
-
-    return final_out;
+    auto a0     = a_coeffs.index({idx::Slice(), 0}).unsqueeze(1);
+    auto a_norm = a_coeffs / a0;
+    auto b_norm = b_coeffs / a0;
+    ctx->save_for_backward({waveform, a_norm, b_norm, y, a0});
+    return y;
   }
 
-  static torch::autograd::variable_list backward(
-      torch::autograd::AutogradContext* ctx,
-      const torch::autograd::variable_list& grad_outputs) {
-
+  static torch::autograd::variable_list backward(torch::autograd::AutogradContext* ctx,
+                                                 const torch::autograd::variable_list& grad_outputs) {
     auto saved = ctx->get_saved_variables();
-    TORCH_CHECK(saved.size() == 5, "internal error: expected 5 saved tensors");
+    auto waveform    = saved[0];
+    auto a_norm      = saved[1];
+    auto b_norm      = saved[2];
+    auto forward_out = saved[3];
+    auto a0          = saved[4];
+    auto grad_output = grad_outputs[0];
 
-    auto waveform    = saved[0];  // [B,C,N]
-    auto a_norm      = saved[1];  // [C,K]
-    auto b_norm      = saved[2];  // [C,K]
-    auto forward_out = saved[3];  // [B,C,N]
-    auto a0          = saved[4];  // [C,1] 
+    const auto B = waveform.size(0), C = waveform.size(1), N = waveform.size(2), K = a_norm.size(1);
 
-    const auto chunk_size = ctx->saved_data["chunk_size"].toInt();
-    auto grad_output = grad_outputs[0]; // [B,C,N]
+    auto grad_output_flipped = grad_output.flip({2});
+    auto grad_fir_out_flipped = iir_only_with_fused(grad_output_flipped, a_norm);
+    auto grad_fir_out = grad_fir_out_flipped.flip({2});
 
-    const auto B = waveform.size(0);
-    const auto C = waveform.size(1);
-    const auto N = waveform.size(2);
-    const auto K = a_norm.size(1);
-
-    auto a_flipped = a_norm.flip({1});                  // [C,K]
-    auto grad_output_flipped = grad_output.flip({2});   // [B,C,N]
-    auto grad_fir_out_flipped = run_iir(grad_output_flipped, a_flipped, chunk_size); // [B,C,N]
-    auto grad_fir_out = grad_fir_out_flipped.flip({2}); // [B,C,N]
-    
-    auto b_weight = b_norm.flip({1}).unsqueeze(1);      // [C,1,K]
-    
-    auto waveform_padded = at::constant_pad_nd(waveform, {K - 1, 0}).contiguous(); // [B,C,N+K-1]
-    
+    auto b_weight = b_norm.flip({1}).unsqueeze(1);
+    auto waveform_padded = at::constant_pad_nd(waveform, {K - 1, 0}).contiguous();
     auto grad_tuple = at::convolution_backward(
-        /*grad_output=*/grad_fir_out,    // [B,C,N]
-        /*input=*/waveform_padded,       // [B,C,N+K-1]
-        /*weight=*/b_weight,             // [C,1,K]
+        grad_fir_out, waveform_padded, b_weight,
         /*bias_sizes=*/c10::nullopt,
-        /*stride=*/{1},
-        /*padding=*/{0},                
-        /*dilation=*/{1},
-        /*transposed=*/false,
-        /*output_padding=*/{0},
+        /*stride=*/{1}, /*padding=*/{0}, /*dilation=*/{1},
+        /*transposed=*/false, /*output_padding=*/{0},
         /*groups=*/C,
         /*output_mask=*/{true, true, false}
     );
-    
-    auto grad_waveform_padded = std::get<0>(grad_tuple);                                    // [B,C,N+K-1]
-    auto grad_waveform = grad_waveform_padded.index({idx::Slice(), idx::Slice(), idx::Slice(K - 1, torch::indexing::None)}).contiguous(); // [B,C,N]
-    auto grad_b_weight = std::get<1>(grad_tuple);                                           // [C,1,K]
-    auto grad_b_norm   = grad_b_weight.squeeze(1).flip({1});                                // [C,K]
-    
-    auto conv_input_padded = at::constant_pad_nd(forward_out, {K - 1, 0}); // [B,C,N+K-1]
-    auto conv_input  = conv_input_padded.view({1, B * C, N + K - 1});      // [1,BC,N+K-1]
-    auto conv_weight = grad_fir_out.view({B * C, 1, N});                   // [BC,1,N]
-    
+    auto grad_waveform_padded = std::get<0>(grad_tuple);
+    auto grad_waveform = grad_waveform_padded.index({idx::Slice(), idx::Slice(), idx::Slice(K - 1, torch::indexing::None)}).contiguous();
+    auto grad_b_weight = std::get<1>(grad_tuple);
+    auto grad_b_norm   = grad_b_weight.squeeze(1).flip({1});
+
+    auto conv_input_padded = at::constant_pad_nd(forward_out, {K - 1, 0});
+    auto conv_input  = conv_input_padded.view({1, B * C, N + K - 1});
+    auto conv_weight = grad_fir_out.view({B * C, 1, N});
     auto grad_a_norm_batched_flipped = -at::convolution(
-        conv_input,                // [1,BC,N+K-1]
-        conv_weight,               // [BC,1,N]
-        /*bias=*/c10::nullopt,
-        /*stride=*/{1},
-        /*padding=*/{0},
-        /*dilation=*/{1},
-        /*transposed=*/false,
-        /*output_padding=*/{0},
-        /*groups=*/B * C
-    ).squeeze(0); // [BC,K]
-    
-    auto grad_a_norm_batched = grad_a_norm_batched_flipped.flip({1}); // [BC,K]
-    auto grad_a_norm_ = grad_a_norm_batched.view({B, C, K}).sum(0);   // [C,K]
-    
+        conv_input, conv_weight, c10::nullopt,
+        {1},{0},{1}, false,{0}, B*C).squeeze(0);
+    auto grad_a_norm_batched = grad_a_norm_batched_flipped.flip({1});
+    auto grad_a_norm_ = grad_a_norm_batched.view({B, C, K}).sum(0);
+
     auto grad_a0 = (-(grad_a_norm_ * a_norm).sum(1, true)
-                    -(grad_b_norm  * b_norm).sum(1, true)) / a0;      // [C,1]
-    
-    auto grad_a = grad_a_norm_ / a0;                                   // [C,K]
-    grad_a.index_put_({idx::Slice(), 0},
-                      grad_a.index({idx::Slice(), 0}) + grad_a0.squeeze(1));
-    auto grad_b = grad_b_norm / a0;                                     // [C,K]
-    
+                    -(grad_b_norm  * b_norm).sum(1, true)) / a0;
+
+    auto grad_a = grad_a_norm_ / a0;
+    grad_a.index_put_({idx::Slice(), 0}, grad_a.index({idx::Slice(), 0}) + grad_a0.squeeze(1));
+    auto grad_b = grad_b_norm / a0;
+
     return {grad_waveform, grad_a, grad_b, torch::Tensor()};
   }
 };
 
-static at::Tensor lfilter_autograd(
-    const at::Tensor& waveform,
-    const at::Tensor& a_coeffs,
-    const at::Tensor& b_coeffs,
-    int64_t chunk_size) {
-  return FlashLFilterAutograd::apply(waveform, a_coeffs, b_coeffs, chunk_size);
+static at::Tensor lfilter_forward_fused(const at::Tensor& x, const at::Tensor& a, const at::Tensor& b, int64_t /*chunk*/){
+  return lfilter_forward_fused_impl(x, a, b);
 }
 
-TORCH_LIBRARY(flashlfilter, m) {
-  m.def("lfilter_autograd(Tensor waveform, Tensor a, Tensor b, int chunk_size) -> Tensor");
+TORCH_LIBRARY(flashlfilterx, m) {
+  m.def("lfilter_forward_fused(Tensor waveform, Tensor a, Tensor b, int chunk_size) -> Tensor");
+  m.def("lfilter_autograd_fused(Tensor waveform, Tensor a, Tensor b, int chunk_size) -> Tensor");
 }
-TORCH_LIBRARY_IMPL(flashlfilter, CompositeExplicitAutograd, m) {
-  m.impl("lfilter_autograd", lfilter_autograd);
+
+TORCH_LIBRARY_IMPL(flashlfilterx, CompositeExplicitAutograd, m) {
+  m.impl("lfilter_forward_fused",      lfilter_forward_fused);
+  m.impl("lfilter_autograd_fused", [](const at::Tensor& x, const at::Tensor& a, const at::Tensor& b, int64_t chunk){
+    return FlashLFilterAutogradFused::apply(x, a, b, chunk);
+  });
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}
